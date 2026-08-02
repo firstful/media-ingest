@@ -134,7 +134,9 @@ def process(video: str) -> None:
 
     srt = video + ".srt"
     if not os.path.exists(srt):
-        transcribe(video, srt)
+        if not transcribe(video, srt):
+            log(f"transcribe failed for {os.path.basename(video)} — will retry next sweep")
+            return  # leave the file in place for a retry
 
     ext = os.path.splitext(video)[1]
     base = os.path.splitext(os.path.basename(video))[0]
