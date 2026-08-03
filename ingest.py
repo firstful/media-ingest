@@ -94,14 +94,19 @@ def target_for(sidecar: dict, base_name: str, ext: str) -> tuple[str, str]:
     if mtype == "tv":
         season = sidecar.get("season") or 1
         ep = sidecar.get("episode")
-        show = re.sub(r"[^\w .'-]+", " ", clean_title).strip()
+        # The sidecar title (from cs-downloader) often carries the episode
+        # suffix, e.g. "Peppa Pig (2004) S01E01". Strip the (year) and any
+        # trailing SxxEyy so we build ONE show dir, not a dir per episode.
+        show_raw = re.sub(r"\s*\(\d{4}\)\s*", " ", clean_title)
+        show_raw = re.sub(r"\s*S\d{2}E\d{2,}\s*$", "", show_raw, flags=re.I)
+        show = re.sub(r"[^\w .'-]+", " ", show_raw)
+        show = re.sub(r"\s{2,}", " ", show).strip()
         show_dir = f"{show} ({year})" if year else show
         season_dir = f"Season {int(season):02d}"
         if ep is not None:
-            fname = f"{show} ({year})" if year else show
-            fname = f"{fname} S{int(season):02d}E{int(ep):02d}{ext}"
+            fname = f"{show} S{int(season):02d}E{int(ep):02d}{ext}"
         else:
-            fname = f"{show} ({year}){ext}" if year else f"{show}{ext}"
+            fname = f"{show}{ext}"
         return (os.path.join("tv", show_dir, season_dir), fname)
     # movie
     name = f"{clean_title} ({year})" if year else clean_title
