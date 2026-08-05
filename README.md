@@ -25,5 +25,14 @@ library (Jellyfin naming) → best-effort library scan.
 
 ```
 movies/Title (Year)/Title (Year).mkv      + .srt + .json sidecar
-tv/Show (Year)/Season 01/Show (Year) S01E01.mkv
+tv/tv_new/Show (Year)/Season 01/Show (Year) S01E01.mkv
+tv/kids/Show (Year)/Season 01/...          (kid_friendly TV)
+kids_movies/Title (Year)/Title (Year).mkv  (kid_friendly movies)
 ```
+
+All publish targets are WATCHED Jellyfin library roots (Shows watches
+`/mnt/new` + `/mnt/tv/tv_new` + `/mnt/tv/adults/tv_formatted`; Kids watches
+`/mnt/tv/kids`; Kids Movies watches the sibling `/mnt/kids_movies`).
+Do NOT publish to `/mnt/tv` root or `/mnt/movies/kids` — those are inside
+other watched roots and either go invisible (Shows root is intentionally
+unwatched) or land in the wrong library.
