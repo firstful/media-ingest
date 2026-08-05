@@ -91,14 +91,10 @@ def target_for(sidecar: dict, base_name: str, ext: str) -> tuple[str, str]:
     clean_title = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
     mtype = sidecar.get("media_type") or "movie"
     kid = bool(sidecar.get("kid_friendly"))
-    # Publish targets must be WATCHED library paths (Jellyfin only indexes
-    # configured roots, and NFS inotify is unreliable). Shows library watches
-    # /mnt/new + /mnt/tv/tv_new + /mnt/tv/adults/tv_formatted — NOT the /mnt/tv
-    # root (keeps kids/youtube out of Shows). Kids Movies watches the SIBLING
-    # root /mnt/kids_movies, not /mnt/movies/kids (a subfolder of the watched
-    # Movies root would land kid movies in the adult library).
-    kid_root = "tv/kids" if mtype == "tv" else "kids_movies"
-    tv_new_root = "tv/tv_new"
+    # /mnt/Media per-library layout (Reed 2026-08-05): INGEST_JELLYFIN_ROOT is
+    # the Media root; libraries are per-folder, not per-type.
+    movie_root = "Kids_Movies" if kid else "Adult_Movies"
+    tv_root = "Kids_TV" if kid else "Adult_TV"
 
     if mtype == "tv":
         season = sidecar.get("season") or 1
@@ -116,16 +112,11 @@ def target_for(sidecar: dict, base_name: str, ext: str) -> tuple[str, str]:
             fname = f"{show} S{int(season):02d}E{int(ep):02d}{ext}"
         else:
             fname = f"{show}{ext}"
-        if kid:
-            base_dir = os.path.join(kid_root, show_dir, season_dir)
-        else:
-            base_dir = os.path.join(tv_new_root, show_dir, season_dir)
+        base_dir = os.path.join(tv_root, show_dir, season_dir)
         return (base_dir, fname)
     # movie
     name = f"{clean_title} ({year})" if year else clean_title
-    if kid:
-        return (os.path.join(kid_root, name), f"{name}{ext}")
-    return (os.path.join("movies", name), f"{name}{ext}")
+    return (os.path.join(movie_root, name), f"{name}{ext}")
 
 
 def scan_jellyfin() -> None:
