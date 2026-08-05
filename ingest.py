@@ -33,6 +33,26 @@ JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
 VIDEO_EXT = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts"}
 WHISPER = None  # lazy import
 
+# Belt-and-suspenders kids routing: even if the cs-downloader sidecar says
+# kid_friendly=false (web UI checkbox default-off), a known children's show
+# still lands in the Kids library. Substring match on the show title.
+KIDS_TITLES = (
+    "peppa pig", "paw patrol", "bluey", "spongebob", "daniel tiger",
+    "arthur", "wild kratts", "dora the explorer", "sesame street",
+    "cocomelon", "mickey mouse", "pj masks", "octonauts",
+    "blaze and the monster machines", "doc mcstuffins", "bubble guppies",
+    "curious george", "thomas & friends", "my little pony", "teletubbies",
+    "blue's clues", "super wings", "pocoyo", "masha and the bear",
+    "winnie the pooh", "little einsteins", "handy manny", "mickey mouse clubhouse",
+    "peppa", "strawberry shortcake", "care bears", "the wiggles", "barney",
+    "pinkfong", "bebefinn", "morphle", "tayo",
+)
+
+
+def is_kids_title(title: str) -> bool:
+    t = (title or "").lower()
+    return any(k in t for k in KIDS_TITLES)
+
 
 def log(msg: str) -> None:
     print(f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {msg}", flush=True)
@@ -90,7 +110,7 @@ def target_for(sidecar: dict, base_name: str, ext: str) -> tuple[str, str]:
     year = parse_year(title)
     clean_title = re.sub(r"\s*\(\d{4}\)\s*$", "", title).strip()
     mtype = sidecar.get("media_type") or "movie"
-    kid = bool(sidecar.get("kid_friendly"))
+    kid = bool(sidecar.get("kid_friendly")) or is_kids_title(clean_title)
     # /mnt/Media per-library layout (Reed 2026-08-05): INGEST_JELLYFIN_ROOT is
     # the Media root; libraries are per-folder, not per-type.
     movie_root = "Kids_Movies" if kid else "Adult_Movies"
