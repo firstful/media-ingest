@@ -168,6 +168,7 @@ def process(video: str) -> None:
 
 
 def sweep() -> None:
+    processed = 0
     try:
         entries = sorted(os.listdir(WATCH_DIR))
     except OSError as e:
@@ -189,8 +190,13 @@ def sweep() -> None:
             continue
         try:
             process(full)
+            processed += 1
         except Exception as e:  # noqa: BLE001
             log(f"process failed {name}: {type(e).__name__}: {e}")
+    # NFS realtime monitor is a no-op — trigger a scan after any publish.
+    if processed:
+        log(f"sweep published {processed} item(s), triggering Jellyfin scan")
+        scan_jellyfin()
 
 
 def main() -> None:
