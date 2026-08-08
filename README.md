@@ -19,6 +19,7 @@ library (Jellyfin naming) → best-effort library scan.
 - INGEST_JELLYFIN_ROOT (default /jellyfin) — static NFS PV of /mnt/raid_store/jellyfin
 - INGEST_WHISPER_MODEL (default small.en), INGEST_WHISPER_DEVICE (cpu)
 - INGEST_POLL_SECONDS, INGEST_SETTLE_SECONDS
+- INGEST_REFRESH_MIN_INTERVAL (default 120) — floor between Jellyfin /Library/Refresh triggers; never cancels a running scan (cancel-loop fix)
 - JELLYFIN_URL / JELLYFIN_API_KEY — optional scan trigger
 
 ## Layout
