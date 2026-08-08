@@ -29,6 +29,12 @@ POLL_SECONDS = int(os.environ.get("INGEST_POLL_SECONDS", "30"))
 SETTLE_SECONDS = float(os.environ.get("INGEST_SETTLE_SECONDS", "6"))
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "")
 JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
+# Coalescing floor between /Library/Refresh triggers — a busy publish queue
+# must not cancel Jellyfin's in-flight scan on every sweep (scan cancel-loop).
+MIN_REFRESH_INTERVAL = float(os.environ.get("INGEST_REFRESH_MIN_INTERVAL", "120"))
+
+_last_refresh_at = 0.0  # time.monotonic() of the last successful trigger
+_pending_refresh = False  # a publish wants a scan but one is running/too recent
 
 VIDEO_EXT = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts"}
 WHISPER = None  # lazy import
@@ -139,8 +145,49 @@ def target_for(sidecar: dict, base_name: str, ext: str) -> tuple[str, str]:
     return (os.path.join(movie_root, name), f"{name}{ext}")
 
 
-def scan_jellyfin() -> None:
+def scan_state() -> str | None:
+    """State of Jellyfin's 'Scan Media Library' task (Idle/Running/Cancelling)."""
     if not (JELLYFIN_URL and JELLYFIN_API_KEY):
+        return None
+    try:
+        req = urllib.request.Request(
+            f"{JELLYFIN_URL}/ScheduledTasks",
+            headers={"X-Emby-Token": JELLYFIN_API_KEY},
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            tasks = json.load(r)
+        for t in tasks or []:
+            if t.get("Name") == "Scan Media Library":
+                return t.get("State")
+    except Exception as e:  # noqa: BLE001
+        log(f"jellyfin task query skipped: {type(e).__name__}: {e}")
+    return None
+
+
+def scan_jellyfin() -> None:
+    """Coalesced, scan-aware /Library/Refresh trigger.
+
+    Every POST /Library/Refresh CANCELS the running scan task, so a busy
+    publish queue that triggers per sweep keeps scans at ~0% forever (the
+    cancel-loop, with EF Core SQLite connection errors on jellyfin.db as a
+    side effect). Rules:
+      - never fire more often than MIN_REFRESH_INTERVAL;
+      - never fire while Scan Media Library is Running/Cancelling — defer.
+    Deferred triggers are flushed by main() once the scan is Idle, so new
+    publishes still get indexed with at most one interval of delay.
+    """
+    global _last_refresh_at, _pending_refresh
+    if not (JELLYFIN_URL and JELLYFIN_API_KEY):
+        return
+    now = time.monotonic()
+    if now - _last_refresh_at < MIN_REFRESH_INTERVAL:
+        log("jellyfin scan deferred (min interval)")
+        _pending_refresh = True
+        return
+    state = scan_state()
+    if state in ("Running", "Cancelling"):
+        log(f"jellyfin scan deferred (task {state})")
+        _pending_refresh = True
         return
     try:
         req = urllib.request.Request(
@@ -149,6 +196,8 @@ def scan_jellyfin() -> None:
             method="POST",
         )
         with urllib.request.urlopen(req, timeout=10) as r:
+            _last_refresh_at = now
+            _pending_refresh = False
             log(f"jellyfin scan triggered: {r.status}")
     except Exception as e:  # noqa: BLE001
         log(f"jellyfin scan skipped: {type(e).__name__}: {e}")
@@ -225,6 +274,10 @@ def main() -> None:
     while True:
         try:
             sweep()
+            # Flush a deferred scan once the running scan is Idle and the
+            # min-interval floor has elapsed (scan_jellyfin decides).
+            if _pending_refresh:
+                scan_jellyfin()
         except Exception as e:  # noqa: BLE001
             log(f"sweep error: {type(e).__name__}: {e}")
         time.sleep(POLL_SECONDS)
