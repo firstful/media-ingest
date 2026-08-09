@@ -4,10 +4,14 @@ Watches /downloads for finished media files (matched by their .json sidecar,
 written by cs-downloader's worker). For each:
   1. settle-wait until the file is stable (NFS-safe)
   2. transcribe audio -> <video>.srt via faster-whisper (CPU, model env-tunable)
+     — each transcribe runs in a FRESH subprocess so whisper's memory is
+     reclaimed per file and a child crash/OOM cannot take down the ingest loop
   3. compute the Jellyfin library target from the sidecar metadata
-     (movie -> /jellyfin/movies/Title (Year)/ ; tv -> /jellyfin/tv/Show/Season NN/Show SxxEyy)
-  4. move video + .srt + sidecar into the target (atomic-ish, .ingested marker)
-  5. best-effort Jellyfin library scan (env JELLYFIN_URL/JELLYFIN_API_KEY; skipped if unset)
+     (movie -> /jellyfin/Media/{Adult,Kids}_Movies/Title (Year)/ ;
+      tv -> /jellyfin/Media/{Adult,Kids}_TV/Show (Year)/Season NN/Show SxxEyy)
+  4. move video + .srt + sidecar into the target
+  5. best-effort Jellyfin library scan (env JELLYFIN_URL/JELLYFIN_API_KEY;
+     skipped if unset)
 """
 from __future__ import annotations
 
@@ -15,11 +19,10 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import time
 import urllib.request
-
-import yaml  # noqa: F401  (keep deps minimal — not used yet)
 
 WATCH_DIR = os.environ.get("INGEST_WATCH_DIR", "/downloads")
 JELLYFIN_ROOT = os.environ.get("INGEST_JELLYFIN_ROOT", "/jellyfin")
@@ -29,15 +32,23 @@ POLL_SECONDS = int(os.environ.get("INGEST_POLL_SECONDS", "30"))
 SETTLE_SECONDS = float(os.environ.get("INGEST_SETTLE_SECONDS", "6"))
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "")
 JELLYFIN_API_KEY = os.environ.get("JELLYFIN_API_KEY", "")
+# Kill a wedged transcribe subprocess after this long (seconds). A 2h movie at
+# ~8x realtime takes ~15 min on this node's CPU; 3600 covers even 4h+ media.
+TRANSCRIBE_TIMEOUT = float(os.environ.get("INGEST_TRANSCRIBE_TIMEOUT", "3600"))
+# Per-file retry backoff for failed transcribes (exponential base/max in
+# seconds) — a file that fails must not be re-transcribed every 30s sweep.
+RETRY_BACKOFF = float(os.environ.get("INGEST_RETRY_BACKOFF", "600"))
+RETRY_BACKOFF_MAX = float(os.environ.get("INGEST_RETRY_BACKOFF_MAX", "7200"))
 # Coalescing floor between /Library/Refresh triggers — a busy publish queue
 # must not cancel Jellyfin's in-flight scan on every sweep (scan cancel-loop).
 MIN_REFRESH_INTERVAL = float(os.environ.get("INGEST_REFRESH_MIN_INTERVAL", "120"))
 
 _last_refresh_at = 0.0  # time.monotonic() of the last successful trigger
 _pending_refresh = False  # a publish wants a scan but one is running/too recent
+_last_attempt: dict[str, float] = {}  # video path -> last transcribe attempt
+_attempts: dict[str, int] = {}  # video path -> consecutive failure count
 
 VIDEO_EXT = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".m4v", ".ts"}
-WHISPER = None  # lazy import
 
 # Belt-and-suspenders kids routing: even if the cs-downloader sidecar says
 # kid_friendly=false (web UI checkbox default-off), a known children's show
@@ -74,29 +85,61 @@ def stable(path: str, seconds: float) -> bool:
     return s1 == s2
 
 
-def transcribe(video: str, srt: str) -> bool:
-    global WHISPER
+def _transcribe_worker(video: str, srt: str) -> int:
+    """Child-process entrypoint: load model, transcribe, write <video>.srt.
+
+    Runs as `ingest.py --transcribe <video> <srt>`; exit 0 = srt written,
+    non-zero = failure (full traceback goes to stderr, visible in pod logs).
+    """
+    import traceback
     try:
-        if WHISPER is None:
-            from faster_whisper import WhisperModel
-            WHISPER = WhisperModel(MODEL, device=DEVICE, compute_type="int8")
+        from faster_whisper import WhisperModel
+        model = WhisperModel(MODEL, device=DEVICE, compute_type="int8")
         log(f"transcribing {os.path.basename(video)} ({MODEL})")
         t0 = time.time()
-        segments, info = WHISPER.transcribe(video, language="en", vad_filter=True)
+        segments, info = model.transcribe(video, language="en", vad_filter=True)
         lines = []
         for seg in segments:
             lines.append(f"{_ts(seg.start)} --> {_ts(seg.end)}\n{seg.text.strip()}\n")
         if not lines:
             log("transcribe produced no segments")
-            return False
+            return 1
         with open(srt, "w", encoding="utf-8") as f:
             for i, block in enumerate(lines, 1):
                 f.write(f"{i}\n{block}\n")
         log(f"wrote {os.path.basename(srt)} ({len(lines)} cues) in {time.time()-t0:.0f}s")
-        return True
-    except Exception as e:  # noqa: BLE001
-        log(f"transcribe failed: {type(e).__name__}: {e}")
+        return 0
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        return 1
+
+
+def transcribe(video: str, srt: str) -> bool:
+    """Transcribe one file in a fresh subprocess (memory-bounded per file).
+
+    faster-whisper keeps the model + decoded audio + VAD buffers resident in
+    the process, so a feature-length transcribe peaks ~4Gi and the baseline
+    never shrinks — two movies in one process blew past the 6Gi pod limit and
+    OOM-killed the container (crash loop). A child process reclaims everything
+    on exit, and a child OOM/segfault only fails that one file (retried after
+    backoff) instead of restarting the whole pod.
+    """
+    cmd = [sys.executable, os.path.abspath(__file__), "--transcribe", video, srt]
+    try:
+        proc = subprocess.run(cmd, timeout=TRANSCRIBE_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        log(f"transcribe timed out after {TRANSCRIBE_TIMEOUT:.0f}s — will retry later")
         return False
+    if proc.returncode != 0:
+        log(f"transcribe subprocess exited {proc.returncode}")
+        return False
+    return os.path.exists(srt)
+
+
+def _retry_delay(video: str) -> float:
+    """Exponential backoff for a file's consecutive transcribe failures."""
+    n = _attempts.get(video, 0)
+    return min(RETRY_BACKOFF * (2 ** max(n - 1, 0)), RETRY_BACKOFF_MAX)
 
 
 def _ts(sec: float) -> str:
@@ -203,7 +246,9 @@ def scan_jellyfin() -> None:
         log(f"jellyfin scan skipped: {type(e).__name__}: {e}")
 
 
-def process(video: str) -> None:
+def process(video: str) -> bool:
+    """Publish one finished file; returns True only if it was actually moved
+    into the library (False = backoff, transcribe failed, or sidecar missing)."""
     sidecar_path = video + ".json"
     try:
         with open(sidecar_path) as f:
@@ -214,9 +259,18 @@ def process(video: str) -> None:
 
     srt = video + ".srt"
     if not os.path.exists(srt):
+        now = time.monotonic()
+        delay = _retry_delay(video)
+        if now - _last_attempt.get(video, 0.0) < delay:
+            left = int(delay - (now - _last_attempt.get(video, 0.0)))
+            log(f"transcribe backoff {os.path.basename(video)} ({left}s left)")
+            return False  # still in backoff — don't hammer a failing file
+        _last_attempt[video] = now
+        _attempts[video] = _attempts.get(video, 0) + 1
         if not transcribe(video, srt):
-            log(f"transcribe failed for {os.path.basename(video)} — will retry next sweep")
-            return  # leave the file in place for a retry
+            log(f"transcribe failed for {os.path.basename(video)} — retry in ~{int(_retry_delay(video))}s")
+            return False  # leave the file in place for a retry
+    _attempts.pop(video, None)
 
     ext = os.path.splitext(video)[1]
     base = os.path.splitext(os.path.basename(video))[0]
@@ -233,6 +287,7 @@ def process(video: str) -> None:
     if os.path.exists(sidecar_path):
         shutil.move(sidecar_path, dest + ".json")
     log(f"published -> {rel_dir}/{os.path.basename(dest)}")
+    return True
 
 
 def sweep() -> None:
@@ -257,8 +312,8 @@ def sweep() -> None:
         if not stable(full, SETTLE_SECONDS):
             continue
         try:
-            process(full)
-            processed += 1
+            if process(full):
+                processed += 1
         except Exception as e:  # noqa: BLE001
             log(f"process failed {name}: {type(e).__name__}: {e}")
     # NFS realtime monitor is a no-op — trigger a scan after any publish.
@@ -284,4 +339,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) == 4 and sys.argv[1] == "--transcribe":
+        sys.exit(_transcribe_worker(sys.argv[2], sys.argv[3]))
     main()

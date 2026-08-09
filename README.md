@@ -19,8 +19,19 @@ library (Jellyfin naming) → best-effort library scan.
 - INGEST_JELLYFIN_ROOT (default /jellyfin) — static NFS PV of /mnt/raid_store/jellyfin
 - INGEST_WHISPER_MODEL (default small.en), INGEST_WHISPER_DEVICE (cpu)
 - INGEST_POLL_SECONDS, INGEST_SETTLE_SECONDS
+- INGEST_TRANSCRIBE_TIMEOUT (default 3600) — kill a wedged transcribe subprocess
+- INGEST_RETRY_BACKOFF (default 600) / INGEST_RETRY_BACKOFF_MAX (7200) —
+  exponential per-file retry floor for failed transcribes (no more re-transcribe
+  every sweep; a poisoned file backs off to 2h max)
 - INGEST_REFRESH_MIN_INTERVAL (default 120) — floor between Jellyfin /Library/Refresh triggers; never cancels a running scan (cancel-loop fix)
 - JELLYFIN_URL / JELLYFIN_API_KEY — optional scan trigger
+
+Each transcribe runs in a **fresh subprocess** (`ingest.py --transcribe <video> <srt>`):
+faster-whisper keeps model + decoded audio resident, so an in-process transcribe
+peaks ~4Gi and the baseline never shrinks — two movies in one process blew the
+6Gi pod limit and OOM-killed the container (68 restarts/35h, fixed in v1.8).
+Subprocess-per-file reclaims memory on exit and a child crash only fails that
+one file (retried after backoff), never the ingest loop.
 
 ## Layout
 
