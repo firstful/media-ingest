@@ -97,7 +97,19 @@ def _transcribe_worker(video: str, srt: str) -> int:
         model = WhisperModel(MODEL, device=DEVICE, compute_type="int8")
         log(f"transcribing {os.path.basename(video)} ({MODEL})")
         t0 = time.time()
-        segments, info = model.transcribe(video, language="en", vad_filter=True)
+        segments, info = model.transcribe(
+            video,
+            language="en",
+            vad_filter=True,
+            # Memory-bounded decode: default beam_size=5 + re-encoding with
+            # previous text pushes a 92-min movie's working set past 6Gi (child
+            # OOM-killed even in a fresh subprocess — measured 2.7Gi RSS and
+            # still climbing mid-movie). Greedy + no history conditioning cuts
+            # peak ~2-3x; subtitle quality impact is negligible and it also
+            # stops whisper's cross-window text hallucination.
+            beam_size=1,
+            condition_on_previous_text=False,
+        )
         lines = []
         for seg in segments:
             lines.append(f"{_ts(seg.start)} --> {_ts(seg.end)}\n{seg.text.strip()}\n")
